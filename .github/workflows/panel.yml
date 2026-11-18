@@ -1,0 +1,92 @@
+name: zen-panel
+
+# 一台 runner = 一个面板实例。5 小时交班，concurrency 保证同名隧道只有一个连接。
+# 公有库：标准 runner 不计分钟；release 资产公开，因此状态快照一律加密。
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_run_sec:
+        description: "本班时长（秒），默认 18000 = 5 小时"
+        required: false
+        default: "18000"
+      fresh_state:
+        description: "1 = 忽略状态快照，空库启动"
+        required: false
+        default: "0"
+  schedule:
+    # 只在 PANEL_DAILY_WINDOW 那种「每天固定窗口」模式需要；连续接力靠交班 dispatch。
+    - cron: "0 1 * * *"
+
+permissions:
+  contents: write   # 读写 release 资产（状态快照）
+  actions: write    # 交班 dispatch 下一次 run
+
+concurrency:
+  group: zen-panel
+  cancel-in-progress: false
+
+env:
+  PANEL_PORT: "8081"
+  STATE_ASSET: "state.bin"
+  STATE_RELEASE: "panel-state"
+
+jobs:
+  panel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+
+    steps:
+      - name: Guard（已有实例在跑就退出）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          other=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/panel.yml/runs?status=in_progress&per_page=50" \
+            --jq "[.workflow_runs[].id] | map(select(. != ${GITHUB_RUN_ID})) | length" 2>/dev/null || echo 0)
+          if [ "${other:-0}" -gt 0 ]; then
+            echo "已有 panel run 在跑（$other 个），本次直接退出"
+            exit 0
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装 cloudflared
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 2 \
+            -o bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x bin/cloudflared bin/zen-console-linux-amd64
+          bin/cloudflared --version
+          bin/zen-console-linux-amd64 -version
+          sha256sum bin/zen-console-linux-amd64
+
+      - name: 启动面板 + 隧道 + 守护 + 交班
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
+          ZEN_API_KEY: ${{ secrets.ZEN_API_KEY }}
+          PANEL_STATE_KEY: ${{ secrets.PANEL_STATE_KEY }}
+          ZEN_ACCOUNTS_JSON: ${{ secrets.ZEN_ACCOUNTS_JSON }}
+          ZEN_PUBLIC_HOST: ${{ vars.ZEN_PUBLIC_HOST }}
+          GH_TOKEN: ${{ github.token }}
+          MAX_RUN_SEC: ${{ inputs.max_run_sec || '18000' }}
+          FRESH_STATE: ${{ inputs.fresh_state || '0' }}
+        run: bash scripts/run-panel.sh
+
+      - name: 摘要
+        if: always()
+        run: |
+          {
+            echo "### zen-panel"
+            echo ""
+            echo "- 开始：$(cat run/started-at.txt 2>/dev/null || echo '?')"
+            echo "- 结束：$(date -u +%FT%TZ)"
+            echo "- 本班时长：$(cat run/uptime.txt 2>/dev/null || echo '?')s"
+            echo "- 公网地址：$(cat run/public-url.txt 2>/dev/null || echo '?')"
+            echo "- 最近快照：$(cat run/checkpoint.txt 2>/dev/null || echo '?')"
+            echo "- 重启次数：$(cat run/restarts.txt 2>/dev/null || echo '?')"
+            echo "- 交班：$( [ -f run/no-handoff ] && echo '已停止（配置错误）' || echo '见上一条 dispatch 日志' )"
+          } >> "$GITHUB_STEP_SUMMARY"

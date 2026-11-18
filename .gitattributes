@@ -1,0 +1,6 @@
+# 二进制按 binary 处理，避免 diff 噪声与换行转换
+bin/zen-direct binary
+bin/zen-console-linux-amd64 binary
+bin/cloudflared binary
+*.sh text eol=lf
+*.py text eol=lf

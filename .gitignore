@@ -1,0 +1,9 @@
+# 运行时产物：不进仓库
+state/
+run/
+logs/
+*.db
+*.db-shm
+*.db-wal
+*.log
+__pycache__/

@@ -1,0 +1,13 @@
+{
+  "port": 8081,
+  "activeNodes": 3,
+  "latencyRouting": false,
+  "fastRefP50Ms": 2000,
+  "slowP95Ms": 8000,
+  "slowFirstByteMs": 6000,
+  "probeIntervalSec": 5,
+  "runPollActiveSec": 60,
+  "runPollIdleSec": 120,
+  "dbPath": "zen-console.db",
+  "templateDir": "template"
+}
