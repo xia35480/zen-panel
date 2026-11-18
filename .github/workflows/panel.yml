@@ -85,7 +85,7 @@ jobs:
             echo "- 开始：$(cat run/started-at.txt 2>/dev/null || echo '?')"
             echo "- 结束：$(date -u +%FT%TZ)"
             echo "- 本班时长：$(cat run/uptime.txt 2>/dev/null || echo '?')s"
-            echo "- 公网地址：$(cat run/public-url.txt 2>/dev/null || echo '?')"
+            echo "- 公网地址：见仓库变量 ZEN_PUBLIC_HOST（日志里已打码）"
             echo "- 最近快照：$(cat run/checkpoint.txt 2>/dev/null || echo '?')"
             echo "- 重启次数：$(cat run/restarts.txt 2>/dev/null || echo '?')"
             echo "- 交班：$( [ -f run/no-handoff ] && echo '已停止（配置错误）' || echo '见上一条 dispatch 日志' )"

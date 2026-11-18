@@ -16,6 +16,9 @@ mkdir -p "$RUN" "$STATE_DIR"
 PORT="${PANEL_PORT:-8081}"
 TTL="${MAX_RUN_SEC:-18000}"
 PUBLIC_HOST="${ZEN_PUBLIC_HOST:-}"
+# 公开仓库的 job 日志是所有人可见的。域名本身能通过 DNS/证书透明日志查到，
+# 但没必要主动写在日志里被人顺手扫到；统一打码，后续出现的地方都会变成 ***。
+[ -n "$PUBLIC_HOST" ] && echo "::add-mask::$PUBLIC_HOST"
 RELEASE_TAG="${STATE_RELEASE:-panel-state}"
 STATE_ASSET="${STATE_ASSET:-state.bin}"
 STATE_FILE="$STATE_DIR/$STATE_ASSET"
