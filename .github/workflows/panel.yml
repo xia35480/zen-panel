@@ -52,6 +52,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Prune old runs（只保留最近 3 条）
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          repo="${{ github.repository }}"
+          keep=3
+          echo "只保留最近 $keep 条 run，更早的删除（含日志）"
+          gh api "repos/$repo/actions/workflows/panel.yml/runs?per_page=100" \
+            --jq '[.workflow_runs[]] | sort_by(.created_at) | reverse | .[3:] | .[].id' \
+          | while read -r id; do
+              [ -n "$id" ] || continue
+              [ "$id" = "${{ github.run_id }}" ] && continue
+              if gh api -X DELETE "repos/$repo/actions/runs/$id" >/dev/null 2>&1; then
+                echo "deleted run $id"
+              else
+                echo "skip run $id（删除失败，可能仍在运行）"
+              fi
+            done
+
       - name: 安装 cloudflared
         run: |
           set -euo pipefail
