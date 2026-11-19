@@ -27,9 +27,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PANEL_PORT: "8081"
+  PANEL_PORT: ${{ vars.PANEL_PORT || '8081' }}
   STATE_ASSET: "state.bin"
   STATE_RELEASE: "panel-state"
+  CLOUDFLARED_VERSION: "2026.11.1"
+  CLOUDFLARED_SHA256: "97bb3b02d23a5980fc9c15a1a270e692da1923f103f920d5b16d4931d5ab55e7"
 
 jobs:
   panel:
@@ -37,7 +39,7 @@ jobs:
     timeout-minutes: 340
 
     steps:
-      - name: Guard（已有实例在跑就退出）
+      - name: Guard（已有实例在跑就失败退出）
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -45,40 +47,49 @@ jobs:
           other=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/panel.yml/runs?status=in_progress&per_page=50" \
             --jq "[.workflow_runs[].id] | map(select(. != ${GITHUB_RUN_ID})) | length" 2>/dev/null || echo 0)
           if [ "${other:-0}" -gt 0 ]; then
-            echo "已有 panel run 在跑（$other 个），本次直接退出"
-            exit 0
+            echo "::error::已有 panel run 在跑（$other 个），本次退出"
+            exit 1
           fi
 
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      - name: Prune old runs（只保留最近 3 条）
+      - name: Prune old runs（只保留最近 5 条 completed）
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
+          KEEP_RUNS: "5"
+          CURRENT_RUN: ${{ github.run_id }}
         run: |
           set -uo pipefail
           repo="${{ github.repository }}"
-          keep=3
-          echo "只保留最近 $keep 条 run，更早的删除（含日志）"
-          gh api "repos/$repo/actions/workflows/panel.yml/runs?per_page=100" \
-            --jq '[.workflow_runs[]] | sort_by(.created_at) | reverse | .[3:] | .[].id' \
-          | while read -r id; do
+          keep="${KEEP_RUNS:-5}"
+          case "$keep" in ''|*[!0-9]*) keep=5 ;; esac
+          current="${CURRENT_RUN:-0}"
+          case "$current" in ''|*[!0-9]*) current=0 ;; esac
+          filter='[.workflow_runs[] | select(.status == "completed") | select(.id != '"$current"')] | sort_by(.created_at) | reverse | .['"$keep"':] | .[].id'
+          echo "只删除 completed 的旧 run，保留最近 $keep 条，跳过当前 run $current 与 queued/in_progress"
+          gh api "repos/$repo/actions/workflows/panel.yml/runs?per_page=100" --jq "$filter" \
+          | while IFS= read -r id; do
               [ -n "$id" ] || continue
-              [ "$id" = "${{ github.run_id }}" ] && continue
+              [ "$id" = "$current" ] && continue
               if gh api -X DELETE "repos/$repo/actions/runs/$id" >/dev/null 2>&1; then
                 echo "deleted run $id"
               else
-                echo "skip run $id（删除失败，可能仍在运行）"
+                echo "skip run $id（删除失败）"
               fi
             done
 
-      - name: 安装 cloudflared
+      - name: 安装 cloudflared（固定版本 + SHA256 校验）
         run: |
           set -euo pipefail
-          curl -fsSL --retry 3 --retry-delay 2 \
-            -o bin/cloudflared \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          version="${CLOUDFLARED_VERSION:?}"
+          sha="${CLOUDFLARED_SHA256:?}"
+          url="https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-amd64"
+          curl -fsSL --retry 3 --retry-delay 2 --max-time 180 -o bin/cloudflared "$url"
+          echo "${sha}  bin/cloudflared" | sha256sum -c -
           chmod +x bin/cloudflared bin/zen-console-linux-amd64
           bin/cloudflared --version
           bin/zen-console-linux-amd64 -version
@@ -91,11 +102,79 @@ jobs:
           ZEN_API_KEY: ${{ secrets.ZEN_API_KEY }}
           PANEL_STATE_KEY: ${{ secrets.PANEL_STATE_KEY }}
           ZEN_ACCOUNTS_JSON: ${{ secrets.ZEN_ACCOUNTS_JSON }}
-          ZEN_PUBLIC_HOST: ${{ vars.ZEN_PUBLIC_HOST }}
+          ZEN_PUBLIC_HOST: ${{ secrets.ZEN_PUBLIC_HOST || vars.ZEN_PUBLIC_HOST }}
+          ZEN_NO_HANDOFF: ${{ vars.ZEN_NO_HANDOFF || '0' }}
           GH_TOKEN: ${{ github.token }}
           MAX_RUN_SEC: ${{ inputs.max_run_sec || '18000' }}
           FRESH_STATE: ${{ inputs.fresh_state || '0' }}
         run: bash scripts/run-panel.sh
+
+      - name: 兜底交班
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZEN_NO_HANDOFF: ${{ vars.ZEN_NO_HANDOFF || '0' }}
+          MAX_RUN_SEC: ${{ inputs.max_run_sec || '18000' }}
+        run: |
+          set -uo pipefail
+          mkdir -p run
+          if [ "${ZEN_NO_HANDOFF:-0}" = "1" ]; then
+            echo "ZEN_NO_HANDOFF=1，跳过兜底交班"
+            exit 0
+          fi
+          if [ -f run/dispatched ]; then
+            echo "run/dispatched 已存在，跳过兜底交班"
+            exit 0
+          fi
+          if [ -f run/no-handoff ]; then
+            echo "run/no-handoff 已存在（脚本主动停止），跳过兜底交班"
+            exit 0
+          fi
+          start=$(cat run/started-epoch.txt 2>/dev/null || echo 0)
+          case "$start" in ''|*[!0-9]*) start=0 ;; esac
+          if [ "$start" -le 0 ]; then
+            started_at=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              --jq '.run_started_at' 2>/dev/null || true)
+            if [ -n "$started_at" ]; then
+              start=$(date -u -d "$started_at" +%s 2>/dev/null || echo 0)
+            fi
+          fi
+          now=$(date +%s)
+          if [ "$start" -le 0 ]; then
+            echo "::warning::无法确定运行时长，跳过兜底交班"
+            exit 0
+          fi
+          elapsed=$((now - start))
+          if [ "$elapsed" -lt 60 ]; then
+            echo "运行 ${elapsed}s（<60s），跳过兜底交班"
+            exit 0
+          fi
+          ttl="${MAX_RUN_SEC:-18000}"
+          case "$ttl" in ''|*[!0-9]*) ttl=18000 ;; esac
+          if [ "${#ttl}" -gt 9 ]; then ttl=18000; fi
+          ttl=$((10#$ttl))
+          if [ "$ttl" -lt 600 ]; then ttl=600; fi
+          if [ "$ttl" -gt 19800 ]; then ttl=19800; fi
+          ref="$GITHUB_REF_NAME"
+          case "$ref" in ''|*[!A-Za-z0-9._/-]*) ref="main" ;; esac
+          payload=$(printf '{"ref":"%s","inputs":{"max_run_sec":"%s","fresh_state":"0"}}' "$ref" "$ttl")
+          for attempt in 1 2 3 4; do
+            code=$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN:?}" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY:?}/actions/workflows/panel.yml/dispatches" \
+              -d "$payload" 2>/dev/null) || code=000
+            if [ "$code" = "204" ]; then
+              date -u +%FT%TZ > run/dispatched
+              echo "兜底交班成功（第 ${attempt} 次）"
+              exit 0
+            fi
+            echo "::warning::兜底交班失败（第 ${attempt}/4 次，HTTP ${code:-000}）"
+            if [ "$attempt" -lt 4 ]; then sleep $((attempt * 5)); fi
+          done
+          echo "::error::兜底交班未成功"
+          exit 1
 
       - name: 摘要
         if: always()
@@ -109,5 +188,11 @@ jobs:
             echo "- 公网地址：见仓库变量 ZEN_PUBLIC_HOST（日志里已打码）"
             echo "- 最近快照：$(cat run/checkpoint.txt 2>/dev/null || echo '?')"
             echo "- 重启次数：$(cat run/restarts.txt 2>/dev/null || echo '?')"
-            echo "- 交班：$( [ -f run/no-handoff ] && echo '已停止（配置错误）' || echo '见上一条 dispatch 日志' )"
+            if [ -f run/dispatched ]; then
+              echo "- 交班：已 dispatch"
+            elif [ -f run/no-handoff ]; then
+              echo "- 交班：已停止（配置错误）"
+            else
+              echo "- 交班：未确认"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
